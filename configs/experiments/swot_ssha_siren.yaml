@@ -1,0 +1,63 @@
+experiment:
+  name: swot_ssha_siren
+  output_root: experiments/swot_ssha_siren
+  checkpoints_dir: experiments/swot_ssha_siren/checkpoints
+  early_stopping:
+    enabled: true
+    patience: 75
+    min_delta: 0.0
+
+data:
+  shards_dir: ../../data/shards/swot_only_ssha/whole_shards
+  train_batchshard_dir: ../../data/shards/swot_only_ssha/batch_shards
+  train_loader: stream
+  num_workers: 10
+  train_num_workers: 10
+  train_cache_shards: true
+  preload_npz: false
+  val_ratio: 0.10
+  test_ratio: 0.05
+  val_full_pass: false
+  val_chunk_size: 4096
+  test_full_pass: true
+  target_normalizer:
+    type: none
+
+model:
+  pe:
+    type: xyzminmax
+    radius: 1.0
+    include_time: true
+    time_norm: minmax
+    spatial_steps: 256
+  net:
+    type: new_siren
+    width: 512
+    depth: 6
+    omega0: 30.0
+    omega0_hidden: 1.0
+    omega0_initial: 30.0
+  loss: mse
+
+optim:
+  lr: 0.001
+  wd: 0.0
+  betas: [0.9, 0.999]
+  schedule: warmcosine
+  warmup_epochs: 40
+  warmup_start_lr: 0.0
+  eta_min: 0.0
+
+regularization:
+  laplace_weight: 1.0e-3      # scales the smoothness penalty added to the loss
+  laplace_k: 8                # neighbours per point for the kNN Laplacian
+  laplace_length_km: 50.0     # length scale controlling how local the smoothing is
+  laplace_max_points: 512     # cap on points used per batch to keep compute bounded
+
+trainer:
+  max_epochs: 300
+  gradient_clip_val: 0.0
+  precision: 32
+  devices: 1
+  accelerator: mps
+  default_root_dir: experiments/swot_ssha_siren

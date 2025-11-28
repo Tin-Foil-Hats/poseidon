@@ -1,0 +1,12 @@
+product: lr_any
+bbox: [-99.0, 17.0, -79.0, 31.0]
+start: "2025-01-01"
+end: "2025-01-05"
+outdir: ../data/example/granules
+dry_run: false
+purge: false
+granule_dir: ../data/example/granules
+watermask_dir: ../data/example/watermask
+shard_outdir: ../data/example/whole_shards
+downsampling_factor: 30
+data_type: SSH

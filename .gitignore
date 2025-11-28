@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments & tooling
+.venv/
+.env
+.env*/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / OS artifacts
+.DS_Store
+.vscode/
+
+# Data artifacts and large binaries
+*.npz
+*.pt
+*.h5
+*.nc
+*.ckpt
+lightning_logs/
+logs/
+wandb/
+outputs/
+/data/
+/experiments/
+results/
+plots/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Configs
+configs/**/*.yaml
+configs/**/*.yml
+configs/**/*.json
+!configs/experiments/example_rect_mlp.yaml
+!configs/experiments/swot_ssha_siren.yaml
+!configs/data/swot_example.yaml
+!configs/data/swot_data.yaml
+!configs/data/swot_ssha.yaml
+!configs/data/gulf_config.json

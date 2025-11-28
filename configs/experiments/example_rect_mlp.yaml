@@ -1,0 +1,47 @@
+experiment:
+  name: example_rect_mlp
+  output_root: experiments/example_rect_mlp
+  checkpoints_dir: experiments/example_rect_mlp/checkpoints
+
+data:
+  shards_dir: ../../data/example/whole_shards
+  train_batchshard_dir: ../../data/example/batch_shards
+  num_workers: 1
+  val_ratio: 0.05
+  test_ratio: 0.05
+  target_normalizer:
+    type: zscore
+
+model:
+  pe:
+    type: rect_baseline
+    include_annual: true
+    include_default_tides: true
+    time_norm: zscore
+  net:
+    type: mlp
+    width: 128
+    depth: 3
+    act: relu
+    dropout: 0.0
+  loss: mse
+
+optim:
+  lr: 0.001
+  wd: 0.0
+  betas: [0.9, 0.999]
+  schedule: cosine_warmup
+  warmup_epochs: 2
+  warmup_start: 0.2
+
+trainer:
+  max_epochs: 4
+  log_every_n_steps: 1
+  gradient_clip_val: 0.0
+  precision: 32
+  devices: 1
+  accelerator: mps
+  limit_train_batches: 4
+  limit_val_batches: 2
+  limit_test_batches: 1
+  default_root_dir: experiments/example_rect_mlp

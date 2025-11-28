@@ -1,0 +1,12 @@
+product: lr_any
+bbox: [-99.0, 17.0, -79.0, 31.0]
+start: "2023-09-19"
+end: "2025-11-22"
+outdir: data/sources/swot
+dry_run: false
+purge: false
+granule_dir: data/sources/swot
+watermask_dir: data/sources/watermask
+shard_outdir: data/shards/swot_only/whole_shards
+downsampling_factor: 30
+data_type: SSH
