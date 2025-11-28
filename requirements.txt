@@ -1,0 +1,32 @@
+# Core ML stack
+torch
+lightning
+einops
+geometric-kernels
+scipy
+numpy
+
+# Data handling
+pandas
+xarray
+pyyaml
+rasterio
+affine
+requests
+earthaccess
+imageio
+cartopy
+
+# Training utilities
+tqdm
+psutil
+pynvml
+
+# Visualization and notebooks
+matplotlib
+holoviews
+hvplot
+IPython
+
+# Testing
+pytest
