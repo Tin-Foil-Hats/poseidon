@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poseidon"
+version = "0.1.0"
+description = "Altimetry and location-encoder ML framework"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+where = ["src"]
