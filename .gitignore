@@ -52,3 +52,6 @@ configs/**/*.json
 !configs/data/swot_data.yaml
 !configs/data/swot_ssha.yaml
 !configs/data/gulf_config.json
+
+# Any exposure of sensitive information
+*.sbatch
