@@ -4,7 +4,7 @@ experiment:
   checkpoints_dir: experiments/swot_ssha_siren/checkpoints
   early_stopping:
     enabled: true
-    patience: 75
+    patience: 30
     min_delta: 0.0
 
 data:
@@ -26,10 +26,10 @@ data:
 model:
   pe:
     type: xyzminmax
-    radius: 1.0
+    radius: 0.7
     include_time: true
     time_norm: minmax
-    spatial_steps: 256
+    spatial_steps: 128
   net:
     type: new_siren
     width: 512
@@ -44,20 +44,20 @@ optim:
   wd: 0.0
   betas: [0.9, 0.999]
   schedule: warmcosine
-  warmup_epochs: 40
+  warmup_epochs: 50
   warmup_start_lr: 0.0
   eta_min: 0.0
 
-regularization:
-  laplace_weight: 1.0e-3      # scales the smoothness penalty added to the loss
-  laplace_k: 8                # neighbours per point for the kNN Laplacian
-  laplace_length_km: 50.0     # length scale controlling how local the smoothing is
-  laplace_max_points: 512     # cap on points used per batch to keep compute bounded
+#regularization:
+#  laplace_weight: 1.0e-3
+#  laplace_k: 8
+#  laplace_length_km: 50.0
+#  laplace_max_points: 512
 
 trainer:
-  max_epochs: 300
+  max_epochs: 200
   gradient_clip_val: 0.0
   precision: 32
   devices: 1
-  accelerator: mps
+  accelerator: gpu
   default_root_dir: experiments/swot_ssha_siren
