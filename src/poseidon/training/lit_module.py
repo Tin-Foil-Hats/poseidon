@@ -46,7 +46,8 @@ class LitRegressor(L.LightningModule):
         pred_raw = pred.reshape(-1)
         y_raw = y.reshape(-1)
         batch_size = max(int(y_raw.numel()), 1)
-        pred_physical = self.target_normalizer.inverse(pred_raw) if self.target_normalizer.active else pred_raw
+        # Model predictions are produced in physical target units even when the loss uses normalized values.
+        pred_physical = pred_raw
 
         if self.target_normalizer.active:
             pred_for_loss = self.target_normalizer.transform(pred_raw)
@@ -141,7 +142,7 @@ class LitRegressor(L.LightningModule):
         batch_size = max(int(y_raw.numel()), 1)
         self.log("val_loss", loss, prog_bar=True, sync_dist=False, batch_size=batch_size)
 
-        pred_physical = self.target_normalizer.inverse(pred_raw) if self.target_normalizer.active else pred_raw
+        pred_physical = pred_raw
         diff = pred_physical - y_raw
         raw_mse = torch.mean(diff * diff)
         self.log(
@@ -182,7 +183,7 @@ class LitRegressor(L.LightningModule):
         batch_size = max(int(y_raw.numel()), 1)
         self.log("test_loss", loss, prog_bar=True, sync_dist=False, batch_size=batch_size)
 
-        pred_physical = self.target_normalizer.inverse(pred_raw) if self.target_normalizer.active else pred_raw
+        pred_physical = pred_raw
         diff = pred_physical - y_raw
         raw_mse = torch.mean(diff * diff)
         self.log(

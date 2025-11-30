@@ -111,11 +111,10 @@ def _gather_arrays(lit_model: LitRegressor, datamodule, device: torch.device, li
             if isinstance(pred, tuple):
                 pred = pred[0]
             pred = pred.reshape(-1)
-            if lit_model.target_normalizer.active:
-                pred = lit_model.target_normalizer.inverse(pred)
+            # Model outputs are already in physical SSH units; normalization is applied only in the loss.
             y = y.reshape(-1)
 
-            pred_chunks.append(pred.cpu().numpy())
+            pred_chunks.append(pred.detach().cpu().numpy())
             target_chunks.append(y.cpu().numpy())
 
             if t is not None:
