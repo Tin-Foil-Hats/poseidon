@@ -37,6 +37,7 @@ outputs/
 /experiments/
 results/
 plots/
+docs/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
