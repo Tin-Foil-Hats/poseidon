@@ -1,6 +1,6 @@
 # Core ML stack
 torch
-lightning
+pytorch-lightning
 einops
 geometric-kernels
 scipy
