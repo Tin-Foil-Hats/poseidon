@@ -7,8 +7,9 @@ import argparse
 import csv
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -329,26 +330,49 @@ def _downsample(values: np.ndarray, max_points: int) -> np.ndarray:
     return values[idx]
 
 
+def _format_iso(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return f"{ts:.2f}"
+
+
+def _parse_time_arg(raw: Optional[str]) -> Optional[float]:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    iso_text = text
+    if iso_text.endswith("Z"):
+        iso_text = iso_text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(iso_text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 def _make_plots(
     out_dir: Path,
     run_name: str,
     preds: np.ndarray,
     targets: np.ndarray,
     times: np.ndarray,
-    lats: np.ndarray,
-    lons: np.ndarray,
-    pixel_data: Dict[str, np.ndarray],
     pass_details: Sequence[Dict[str, Any]],
+    pass_plot_time: Optional[float],
+    pass_plot_window: float,
     max_points: int,
     max_pass_maps: int,
-    pixel_plot_count: int = 12,
 ) -> None:
     plot_dir = out_dir
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     sample_preds = _downsample(preds, max_points)
     sample_targets = _downsample(targets, max_points)
-
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(sample_targets, sample_preds, s=6, alpha=0.5, edgecolor="none")
     lims = [min(sample_targets.min(), sample_preds.min()), max(sample_targets.max(), sample_preds.max())]
@@ -361,86 +385,74 @@ def _make_plots(
     fig.savefig(plot_dir / "pred_vs_target.png", dpi=150)
     plt.close(fig)
 
-    if not np.all(np.isnan(times)):
-        sample_times = _downsample(times, max_points)
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.scatter(sample_times, _downsample(targets, max_points), s=5, alpha=0.4, label="Target", edgecolor="none")
-        ax.scatter(sample_times, _downsample(preds, max_points), s=5, alpha=0.4, label="Prediction", edgecolor="none")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("SSH")
-        ax.set_title(f"{run_name} Temporal Samples")
-        ax.legend(loc="upper right")
-        ax.grid(True, linewidth=0.3, alpha=0.5)
-        fig.tight_layout()
-        fig.savefig(plot_dir / "time_series_scatter.png", dpi=150)
+    if not pass_details or max_pass_maps <= 0:
+        return
+
+    window = max(float(pass_plot_window), 0.0)
+    pass_dir_root = plot_dir / "per_pass_plots"
+    pass_dir_root.mkdir(parents=True, exist_ok=True)
+    for detail in pass_details[:max_pass_maps]:
+        raw = detail.get("raw") or {}
+        lat_arr = np.asarray(raw.get("lat"), dtype=np.float32)
+        lon_arr = np.asarray(raw.get("lon"), dtype=np.float32)
+        time_arr = np.asarray(raw.get("time"), dtype=np.float64)
+        pred_arr = np.asarray(raw.get("preds"), dtype=np.float32)
+        target_arr = np.asarray(raw.get("targets"), dtype=np.float32)
+        if lat_arr.size == 0 or lon_arr.size == 0:
+            continue
+
+        finite_mask = np.isfinite(time_arr)
+        candidate_times = time_arr[finite_mask]
+        if candidate_times.size == 0:
+            chosen_time = None
+        elif pass_plot_time is not None and np.isfinite(pass_plot_time):
+            chosen_time = float(pass_plot_time)
+        else:
+            chosen_time = float(np.median(candidate_times))
+
+        if chosen_time is not None:
+            if window > 0.0:
+                mask = np.abs(time_arr - chosen_time) <= window
+            else:
+                idx = int(np.argmin(np.abs(time_arr - chosen_time)))
+                mask = np.zeros_like(time_arr, dtype=bool)
+                mask[idx] = True
+        else:
+            mask = np.ones_like(lat_arr, dtype=bool)
+
+        if not np.any(mask):
+            continue
+
+        use_lat = lat_arr[mask]
+        use_lon = lon_arr[mask]
+        use_pred = pred_arr[mask]
+        use_target = target_arr[mask]
+        use_time = time_arr[mask]
+        timestamp_text = _format_iso(float(np.median(use_time))) if use_time.size else "unknown"
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+        for ax, data, title in zip(
+            axes,
+            (use_target, use_pred),
+            ("Target", "Prediction"),
+        ):
+            sc = ax.scatter(use_lon, use_lat, c=data, cmap="coolwarm", s=12, edgecolors="none")
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title(title)
+            ax.grid(True, linewidth=0.3, alpha=0.4)
+            fig.colorbar(sc, ax=ax, shrink=0.85, label="SSH (m)")
+        pass_id = detail.get("pass_id")
+        title_bits: List[str] = [run_name]
+        if pass_id is not None:
+            title_bits.append(f"Pass {pass_id}")
+        title_bits.append(timestamp_text)
+        fig.suptitle(" | ".join(title_bits))
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        pass_dir = pass_dir_root / (f"pass_{int(pass_id):03d}" if pass_id is not None else "pass_unknown")
+        pass_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(pass_dir / "timestamp_scatter.png", dpi=150)
         plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        residuals = sample_preds - sample_targets
-        ax.scatter(sample_times, residuals, s=5, alpha=0.4, edgecolor="none")
-        ax.axhline(0.0, color="k", linewidth=1.0, linestyle="--", alpha=0.6)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Prediction - Target")
-        ax.set_title(f"{run_name} Residuals vs Time")
-        ax.grid(True, linewidth=0.3, alpha=0.5)
-        fig.tight_layout()
-        fig.savefig(plot_dir / "residuals_vs_time.png", dpi=150)
-        plt.close(fig)
-
-    pixel_groups = _group_indices_by_pixel(lats, lons)
-    eligible = [
-        (key, idxs)
-        for key, idxs in pixel_groups.items()
-        if idxs.size >= 2 and np.count_nonzero(~np.isnan(times[idxs])) >= 2
-    ]
-    if eligible:
-        step = max(len(eligible) // pixel_plot_count, 1)
-        selected = eligible[::step][:pixel_plot_count]
-        pixel_dir = plot_dir / "pixel_timeseries"
-        pixel_dir.mkdir(parents=True, exist_ok=True)
-        for (plat, plon), idxs in selected:
-            order = np.argsort(times[idxs])
-            idxs_sorted = idxs[order]
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(times[idxs_sorted], targets[idxs_sorted], label="Target", marker="o", linewidth=1.0, markersize=3)
-            ax.plot(times[idxs_sorted], preds[idxs_sorted], label="Prediction", marker="o", linewidth=1.0, markersize=3)
-            ax.set_xlabel("Time")
-            ax.set_ylabel("SSH")
-            ax.set_title(f"{run_name}\nlat={plat:.3f}, lon={plon:.3f}")
-            ax.grid(True, linewidth=0.3, alpha=0.5)
-            ax.legend(loc="best")
-            fig.tight_layout()
-            lat_tag = f"{plat:+.3f}".replace(".", "p").replace("-", "m")
-            lon_tag = f"{plon:+.3f}".replace(".", "p").replace("-", "m")
-            fig.savefig(pixel_dir / f"pixel_lat{lat_tag}_lon{lon_tag}.png", dpi=150)
-            plt.close(fig)
-
-    map_root = plot_dir / "maps"
-    map_root.mkdir(parents=True, exist_ok=True)
-    limits = _compute_map_limits(pixel_data)
-    _plot_spatial_maps(map_root, run_name, pixel_data, limits, title_suffix="")
-
-    if pass_details:
-        for detail in pass_details[:max_pass_maps]:
-            pass_id = detail.get("pass_id")
-            pass_pixel_data = detail.get("pixel_data", {})
-            pass_metrics = detail.get("metrics", {})
-            samples = detail.get("samples")
-            subdir = map_root / f"pass_{int(pass_id):03d}" if pass_id is not None else map_root / "pass_unknown"
-            subdir.mkdir(parents=True, exist_ok=True)
-            pieces: List[str] = []
-            if pass_id is not None:
-                pieces.append(f"Pass {pass_id}")
-            r2 = pass_metrics.get("r2") if isinstance(pass_metrics, dict) else None
-            corr = pass_metrics.get("corr") if isinstance(pass_metrics, dict) else None
-            if r2 is not None:
-                pieces.append(f"R²={_format_metric(r2)}")
-            if corr is not None:
-                pieces.append(f"corr={_format_metric(corr)}")
-            if samples:
-                pieces.append(f"N={samples}")
-            title_suffix = " | ".join(pieces)
-            _plot_spatial_maps(subdir, run_name, pass_pixel_data, limits, title_suffix=title_suffix)
 
 
 def _plot_spatial_maps(
@@ -547,6 +559,10 @@ def evaluate_run(
     limit_batches: Optional[int],
     max_points: int,
     max_pass_maps: int,
+    *,
+    pass_plot_time: Optional[float],
+    pass_plot_window: float,
+    produce_plots: bool,
 ) -> EvaluationResult:
     cfg_path = run_dir / "config_used.yaml"
     metrics_file = run_dir / "final_metrics.txt"
@@ -588,6 +604,14 @@ def evaluate_run(
     per_pixel_path = _write_per_pixel_metrics(out_dir, pixel_data)
     metrics["per_pixel_metrics_file"] = str(per_pixel_path)
 
+    map_limits = _compute_map_limits(pixel_data)
+    if produce_plots:
+        map_suffix = (
+            f"| R^2={_format_metric(metrics['r2'], '.3f')} "
+            f"| corr={_format_metric(metrics['corr'], '.3f')} | N={preds.size:,}"
+        )
+        _plot_spatial_maps(out_dir / "per_pixel_maps", run_dir.name, pixel_data, map_limits, map_suffix)
+
     pass_details: List[Dict[str, Any]] = []
     per_pass_info: Dict[str, Any] = {}
     unique_passes = np.unique(pass_ids)
@@ -608,7 +632,20 @@ def evaluate_run(
             pass_pixel_stats, pass_pixel_data = _pixel_stats(pass_groups, pass_preds, pass_targets)
             pass_dir = out_dir / "per_pass" / f"pass_{pid:03d}"
             pass_metrics_path = _write_per_pixel_metrics(pass_dir, pass_pixel_data)
+            pass_map_limits = _compute_map_limits(pass_pixel_data)
             sample_count = int(pass_preds.size)
+            if produce_plots:
+                pass_suffix = (
+                    f"| R^2={_format_metric(pass_metrics['r2'], '.3f')} "
+                    f"| corr={_format_metric(pass_metrics['corr'], '.3f')} | N={sample_count:,}"
+                )
+                _plot_spatial_maps(
+                    pass_dir / "per_pixel_maps",
+                    f"{run_dir.name} Pass {pid:03d}",
+                    pass_pixel_data,
+                    pass_map_limits,
+                    pass_suffix,
+                )
             pass_record = {
                 "pass_id": int(pid),
                 "metrics": pass_metrics,
@@ -616,6 +653,13 @@ def evaluate_run(
                 "pixel_data": pass_pixel_data,
                 "samples": sample_count,
                 "per_pixel_metrics_file": str(pass_metrics_path),
+                "raw": {
+                    "lat": lats[mask],
+                    "lon": lons[mask],
+                    "time": times[mask],
+                    "preds": pass_preds,
+                    "targets": pass_targets,
+                },
             }
             pass_details.append(pass_record)
             per_pass_info[str(int(pid))] = {
@@ -640,19 +684,19 @@ def evaluate_run(
     if per_pass_info:
         metrics["per_pass"] = per_pass_info
 
-    _make_plots(
-        out_dir,
-        run_dir.name,
-        preds,
-        targets,
-        times,
-        lats,
-        lons,
-        pixel_data,
-        pass_details,
-        max_points=max_points,
-        max_pass_maps=max_pass_maps,
-    )
+    if produce_plots:
+        _make_plots(
+            out_dir,
+            run_dir.name,
+            preds,
+            targets,
+            times,
+            pass_details,
+            pass_plot_time=pass_plot_time,
+            pass_plot_window=pass_plot_window,
+            max_points=max_points,
+            max_pass_maps=max_pass_maps,
+        )
     metrics_path = _write_metrics(out_dir, metrics, preds.size, checkpoint)
 
     return EvaluationResult(
@@ -722,7 +766,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", help="Device for inference (cpu, mps, cuda:0, ...).")
     parser.add_argument("--limit-batches", type=int, default=None, help="Optional cap on number of test batches per run.")
     parser.add_argument("--max-points", type=int, default=20000, help="Max points for scatter plots.")
-    parser.add_argument("--max-pass-maps", type=int, default=2, help="Maximum number of test passes to visualize in map form.")
+    parser.add_argument("--max-pass-maps", type=int, default=2, help="Maximum number of test passes to include in per-pass plots.")
+    parser.add_argument(
+        "--pass-plot-time",
+        help="Timestamp (seconds or ISO8601) to center per-pass plots. Defaults to the median pass time when omitted.",
+    )
+    parser.add_argument(
+        "--pass-plot-window",
+        type=float,
+        default=0.0,
+        help="Half-width (seconds) around the selected timestamp when plotting per-pass samples (default 0 = single timestamp).",
+    )
+    parser.add_argument("--skip-plots", action="store_true", help="Disable plot generation during evaluation.")
     return parser.parse_args()
 
 
@@ -746,6 +801,9 @@ def main() -> None:
             limit_batches=args.limit_batches,
             max_points=args.max_points,
             max_pass_maps=args.max_pass_maps,
+            pass_plot_time=_parse_time_arg(args.pass_plot_time),
+            pass_plot_window=args.pass_plot_window,
+            produce_plots=not args.skip_plots,
         )
         print(
             f"  rmse={result.rmse:.4f} mae={result.mae:.4f} bias={result.bias:.4f} "

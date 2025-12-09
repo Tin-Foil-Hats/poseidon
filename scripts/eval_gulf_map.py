@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -14,9 +15,12 @@ import torch
 import yaml
 
 try:
-	import imageio  
-except ImportError: 
-	imageio = None
+	import imageio.v2 as imageio
+except ImportError:
+	try:
+		import imageio
+	except ImportError:
+		imageio = None
 
 try: 
 	import cartopy.crs as ccrs 
@@ -28,6 +32,31 @@ except ImportError:
 from poseidon.data.schema import load_shard
 from poseidon.data.shards import parse_cycle_pass_from_name
 from poseidon.training import LitRegressor, create_datamodule_from_config
+
+
+@dataclass(frozen=True)
+class GridSpec:
+	lat_values: np.ndarray
+	lon_values: np.ndarray
+	lat_points: np.ndarray
+	lon_points: np.ndarray
+	lat_indices: np.ndarray
+	lon_indices: np.ndarray
+	is_complete_mesh: bool
+	point_times: np.ndarray | None = None
+	extras: dict[str, np.ndarray] | None = None
+
+	@property
+	def point_count(self) -> int:
+		return int(self.lat_points.size)
+
+
+COLORBAR_PAD = 0.055
+COLORBAR_FRACTION = 0.055
+COVERAGE_SCATTER_SIZE = 4.0
+COVERAGE_SCATTER_ALPHA = 0.4
+MISFIT_CMAP = "seismic"
+MISFIT_DEFAULT_LIMITS = (-0.2, 0.2)
 
 
 def _get(cfg: Mapping[str, Any], path: str, default: Any = None) -> Any:
@@ -63,6 +92,78 @@ def _apply_base_paths(cfg: dict[str, Any], *, config_dir: Path) -> None:
 		value = _get(cfg, field)
 		if isinstance(value, str):
 			_set(cfg, field, str(_resolve_path(value, base=config_dir)))
+
+
+def _load_grid_csv(csv_path: Path) -> GridSpec:
+	csv_path = csv_path.expanduser().resolve()
+	if not csv_path.exists():
+		raise FileNotFoundError(f"Grid CSV not found: {csv_path}")
+	data = np.genfromtxt(csv_path, delimiter=",", names=True, dtype=None, encoding="utf-8", ndmin=1)
+	if data.size == 0:
+		raise ValueError(f"Grid CSV {csv_path} has no rows")
+	if data.dtype.names is None:
+		raise ValueError(f"Grid CSV {csv_path} must include column headers")
+	try:
+		lat_arr = np.asarray(data["lat"], dtype=np.float64).reshape(-1)
+		lon_arr = np.asarray(data["lon"], dtype=np.float64).reshape(-1)
+	except (KeyError, ValueError) as exc:
+		raise ValueError(f"Grid CSV {csv_path} must contain 'lat' and 'lon' columns") from exc
+	lat_arr = lat_arr.astype(np.float32, copy=False)
+	lon_arr = lon_arr.astype(np.float32, copy=False)
+	if lat_arr.size == 0 or lon_arr.size == 0:
+		raise ValueError(f"Grid CSV {csv_path} did not provide valid lat/lon values")
+	lat_vals, lat_inv = np.unique(lat_arr, return_inverse=True)
+	lon_vals, lon_inv = np.unique(lon_arr, return_inverse=True)
+	coords = np.stack([lat_inv, lon_inv], axis=1)
+	unique_pairs = np.unique(coords, axis=0)
+	is_mesh = unique_pairs.shape[0] == lat_vals.size * lon_vals.size
+	point_times: np.ndarray | None = None
+	extras: dict[str, np.ndarray] = {}
+	for name in data.dtype.names:
+		if name in ("lat", "lon"):
+			continue
+		col = np.asarray(data[name])
+		extras[name] = col.reshape(-1)
+	for candidate in ("time", "t", "timestamp"):
+		if candidate in extras:
+			try:
+				point_times = np.asarray(extras[candidate], dtype=np.float32).reshape(-1)
+			except ValueError as exc:
+				raise ValueError(f"Column '{candidate}' in {csv_path} must be numeric if provided") from exc
+			break
+	return GridSpec(
+		lat_values=lat_vals.astype(np.float32, copy=False),
+		lon_values=lon_vals.astype(np.float32, copy=False),
+		lat_points=lat_arr.reshape(-1),
+		lon_points=lon_arr.reshape(-1),
+		lat_indices=lat_inv.astype(np.int64, copy=False),
+		lon_indices=lon_inv.astype(np.int64, copy=False),
+		is_complete_mesh=bool(is_mesh),
+		point_times=point_times,
+		extras=extras or None,
+	)
+
+
+def _make_rect_grid(lat_vals: np.ndarray, lon_vals: np.ndarray) -> GridSpec:
+	lat_vals = np.asarray(lat_vals, dtype=np.float32)
+	lon_vals = np.asarray(lon_vals, dtype=np.float32)
+	if lat_vals.size == 0 or lon_vals.size == 0:
+		raise ValueError("lat/lon axes must contain at least one entry")
+	n_lat = int(lat_vals.size)
+	n_lon = int(lon_vals.size)
+	lat_points = np.repeat(lat_vals, n_lon)
+	lon_points = np.tile(lon_vals, n_lat)
+	lat_indices = np.repeat(np.arange(n_lat, dtype=np.int64), n_lon)
+	lon_indices = np.tile(np.arange(n_lon, dtype=np.int64), n_lat)
+	return GridSpec(
+		lat_values=lat_vals,
+		lon_values=lon_vals,
+		lat_points=lat_points,
+		lon_points=lon_points,
+		lat_indices=lat_indices,
+		lon_indices=lon_indices,
+		is_complete_mesh=True,
+	)
 
 
 def _load_cfg(cfg_path: Path) -> dict[str, Any]:
@@ -235,21 +336,25 @@ def _evaluate_points(
 
 
 def _quantile_clamp(data: np.ndarray, low: float = 2.0, high: float = 98.0) -> tuple[float, float]:
-	abs_vals = np.abs(data)
-	if abs_vals.size == 0:
+	flat = np.asarray(data, dtype=np.float64).reshape(-1)
+	finite = flat[np.isfinite(flat)]
+	if finite.size == 0:
 		return -1.0, 1.0
+	abs_vals = np.abs(finite)
 	q_low = float(np.percentile(abs_vals, low))
 	q_high = float(np.percentile(abs_vals, high))
 	limit = max(q_high, 1e-6)
-	if np.any(data < 0):
+	if np.any(finite < 0):
 		return -limit, limit
 	return q_low, limit
 
 
 def _symmetric_limits(data: np.ndarray, quantile: float = 98.0) -> tuple[float, float]:
-	abs_vals = np.abs(data)
-	if abs_vals.size == 0:
+	flat = np.asarray(data, dtype=np.float64).reshape(-1)
+	finite = flat[np.isfinite(flat)]
+	if finite.size == 0:
 		return -1.0, 1.0
+	abs_vals = np.abs(finite)
 	hi = float(np.percentile(abs_vals, quantile))
 	hi = max(hi, 1e-6)
 	return -hi, hi
@@ -275,8 +380,13 @@ def _plot_frame(
 	point_lat = np.asarray(point_data.get("lat", [])) if point_data else np.array([])
 	point_lon = np.asarray(point_data.get("lon", [])) if point_data else np.array([])
 	point_vals = np.asarray(point_data.get("values", [])) if point_data else np.array([])
+	has_points = point_lat.size > 0 and point_lon.size > 0
+	if show_highlight and not has_points:
+		show_highlight = False
 
 	if show_misfit and (misfit_values is None or misfit_values.size == 0):
+		show_misfit = False
+	if show_misfit and not has_points:
 		show_misfit = False
 
 	if not show_misfit and not show_highlight:
@@ -297,15 +407,15 @@ def _plot_frame(
 	else:
 		vmin_field, vmax_field = _quantile_clamp(field)
 
-	mode = "misfit" if show_misfit else "highlight"
-
+	panel_count = 1 + int(show_highlight) + int(show_misfit)
+	cmap_pred = "coolwarm"
 	if use_cartopy and ccrs is not None and cfeature is not None:
 		proj = ccrs.PlateCarree()
-		fig = plt.figure(figsize=(16, 6))
-		gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.12)
-		ax_pred = fig.add_subplot(gs[0, 0], projection=proj)
-		ax_second = fig.add_subplot(gs[0, 1], projection=proj)
-		for axis in (ax_pred, ax_second):
+		fig = plt.figure(figsize=(8 * panel_count, 6))
+		gs = fig.add_gridspec(1, panel_count, width_ratios=[1.0] * panel_count, wspace=0.12)
+		axes = []
+		for idx in range(panel_count):
+			axis = fig.add_subplot(gs[0, idx], projection=proj)
 			axis.coastlines(resolution="10m", color="black", linewidth=0.6)
 			axis.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.4)
 			axis.add_feature(cfeature.LAND.with_scale("10m"), facecolor="0.9", alpha=0.5)
@@ -314,109 +424,84 @@ def _plot_frame(
 			 [float(lon_vals.min()), float(lon_vals.max()), float(lat_vals.min()), float(lat_vals.max())],
 			 crs=proj,
 			)
+			axes.append(axis)
 	else:
 		proj = None
-		fig, (ax_pred, ax_second) = plt.subplots(1, 2, figsize=(16, 6), sharex=True, sharey=True)
-		for axis in (ax_pred, ax_second):
+		fig, axes = plt.subplots(1, panel_count, figsize=(8 * panel_count, 6), sharex=True, sharey=True)
+		if panel_count == 1:
+			axes = [axes]
+		elif not isinstance(axes, (list, tuple)):
+			axes = list(np.atleast_1d(axes))
+		for axis in axes:
 			axis.set_aspect("equal", adjustable="box")
 			axis.set_xlabel("Longitude (deg)")
 			axis.set_ylabel("Latitude (deg)")
 			axis.grid(True, linewidth=0.4, alpha=0.35)
 
+	ax_pred = axes[0]
+	next_idx = 1
+	ax_highlight = axes[next_idx] if show_highlight else None
+	if show_highlight:
+		next_idx += 1
+	ax_misfit = axes[next_idx] if show_misfit else None
+
 	if proj is not None:
 		mesh_pred = ax_pred.pcolormesh(
-		 lon_vals,
-		 lat_vals,
-		 field,
-		 transform=proj,
-		 cmap="viridis",
-		 shading="auto",
-		 vmin=vmin_field,
-		 vmax=vmax_field,
+			lon_vals,
+			lat_vals,
+			field,
+			transform=proj,
+			cmap=cmap_pred,
+			shading="auto",
+			vmin=vmin_field,
+			vmax=vmax_field,
 		)
 	else:
 		mesh_pred = ax_pred.pcolormesh(
-		 lon_vals,
-		 lat_vals,
-		 field,
-		 cmap="viridis",
-		 shading="auto",
-		 vmin=vmin_field,
-		 vmax=vmax_field,
+			lon_vals,
+			lat_vals,
+			field,
+			cmap=cmap_pred,
+			shading="auto",
+			vmin=vmin_field,
+			vmax=vmax_field,
 		)
 
-	if overlays:
-		_apply_overlays(ax_pred, overlays, proj, vmin_field, vmax_field)
-
-	if mode == "misfit":
-		if misfit_limits is None:
-			misfit_limits = _symmetric_limits(misfit_values)
-		vmin_misfit, vmax_misfit = misfit_limits
+	sc_highlight = None
+	if ax_highlight is not None:
 		if proj is not None:
-			ax_second.pcolormesh(
-			 lon_vals,
-			 lat_vals,
-			 field,
-			 transform=proj,
-			 cmap="Greys",
-			 shading="auto",
-			 alpha=0.35,
+			ax_highlight.pcolormesh(
+				lon_vals,
+				lat_vals,
+				field,
+				transform=proj,
+				cmap="Greys",
+				shading="auto",
+				alpha=0.18,
 			)
 		else:
-			ax_second.pcolormesh(
-			 lon_vals,
-			 lat_vals,
-			 field,
-			 cmap="Greys",
-			 shading="auto",
-			 alpha=0.35,
+			ax_highlight.pcolormesh(
+				lon_vals,
+				lat_vals,
+				field,
+				cmap="Greys",
+				shading="auto",
+				alpha=0.18,
 			)
-		sc = ax_second.scatter(
-		 point_lon,
-		 point_lat,
-		 c=misfit_values,
-		 cmap="seismic",
-		 vmin=vmin_misfit,
-		 vmax=vmax_misfit,
-		 s=25.0,
-		 linewidths=0.3,
-		 edgecolors="k",
-		 alpha=0.85,
-		 transform=proj if proj is not None else None,
-		)
-		if overlays:
-			_apply_overlays(ax_second, overlays, proj, vmin_field, vmax_field, include_scatter=False)
-		ax_second.set_title(f"{title} | Misfit (pred - obs)")
-	else:
-		if proj is not None:
-			ax_second.pcolormesh(
-			 lon_vals,
-			 lat_vals,
-			 field,
-			 transform=proj,
-			 cmap="Greys",
-			 shading="auto",
-			 alpha=0.15,
-			)
-		else:
-			ax_second.pcolormesh(
-			 lon_vals,
-			 lat_vals,
-			 field,
-			 cmap="Greys",
-			 shading="auto",
-			 alpha=0.15,
-			)
+		style = dict((point_data or {}).get("style", {})) if point_data else {}
 		highlight_kwargs: dict[str, Any] = {
-		 "s": 9.0,
-		 "alpha": 0.9,
-		 "linewidths": 0.0,
+		 "s": float(style.get("size", 9.0)),
+		 "alpha": float(style.get("alpha", 0.9)),
+		 "linewidths": float(style.get("linewidths", 0.0)),
 		}
+		for key in ("marker", "edgecolors", "facecolors"):
+			if key in style:
+				highlight_kwargs[key] = style[key]
 		if point_vals.size:
 			highlight_kwargs.update(
 			 {
 			  "c": point_vals,
-			  "cmap": "viridis",
+			  "cmap": cmap_pred,
 			  "vmin": vmin_field,
 			  "vmax": vmax_field,
 			 }
@@ -425,21 +510,78 @@ def _plot_frame(
 			highlight_kwargs["c"] = "tab:red"
 		if proj is not None:
 			highlight_kwargs["transform"] = proj
-		sc_highlight = ax_second.scatter(point_lon, point_lat, **highlight_kwargs)
+		sc_highlight = ax_highlight.scatter(point_lon, point_lat, **highlight_kwargs)
 		if overlays:
-			_apply_overlays(ax_second, overlays, proj, vmin_field, vmax_field, include_scatter=False)
-		ax_second.set_title(f"{title} | Coverage Highlight")
+			_apply_overlays(ax_highlight, overlays, proj, vmin_field, vmax_field, include_scatter=False)
+		ax_highlight.set_title(f"{title} | Ground Truth")
+
+	sc_misfit = None
+	if ax_misfit is not None:
+		if misfit_limits is None:
+			misfit_limits = MISFIT_DEFAULT_LIMITS
+		vmin_misfit, vmax_misfit = misfit_limits
+		if proj is not None:
+			ax_misfit.pcolormesh(
+				lon_vals,
+				lat_vals,
+				field,
+				transform=proj,
+				cmap="Greys",
+				shading="auto",
+				alpha=0.3,
+			)
+		else:
+			ax_misfit.pcolormesh(
+				lon_vals,
+				lat_vals,
+				field,
+				cmap="Greys",
+				shading="auto",
+				alpha=0.3,
+			)
+		base_style = dict((point_data or {}).get("style", {})) if point_data else {}
+		misfit_size = float(base_style.get("size", 9.0))
+		scatter_kwargs: dict[str, Any] = {
+		 "c": misfit_values,
+		 "cmap": MISFIT_CMAP,
+		 "vmin": vmin_misfit,
+		 "vmax": vmax_misfit,
+		 "s": misfit_size,
+		 "linewidths": float(base_style.get("linewidths", 0.0)),
+		 "edgecolors": base_style.get("edgecolors", "none"),
+		 "alpha": float(base_style.get("alpha", 0.85)),
+		}
+		for key in ("marker", "facecolors"):
+			if key in base_style:
+				scatter_kwargs[key] = base_style[key]
+		if proj is not None:
+			scatter_kwargs["transform"] = proj
+		sc_misfit = ax_misfit.scatter(point_lon, point_lat, **scatter_kwargs)
+		ax_misfit.set_title(f"{title} | Misfit (pred - obs)")
+
+	if show_highlight and ax_highlight is not None and sc_highlight is not None:
+		cbar_axes: Any = [ax_pred, ax_highlight]
+	else:
+		cbar_axes = ax_pred
 
 	ax_pred.set_title(f"{title} | Prediction")
-
-	cbar_pred = fig.colorbar(mesh_pred, ax=ax_pred, orientation="horizontal", pad=0.08)
-	cbar_pred.set_label("SSH (m)")
-	if mode == "misfit":
-		cbar_mis = fig.colorbar(sc, ax=ax_second, orientation="horizontal", pad=0.08)
+	cbar_pred = fig.colorbar(
+		mesh_pred,
+		ax=cbar_axes,
+		orientation="horizontal",
+		pad=COLORBAR_PAD,
+		fraction=COLORBAR_FRACTION,
+	)
+	cbar_pred.set_label("SSHA (m)")
+	if sc_misfit is not None and ax_misfit is not None:
+		cbar_mis = fig.colorbar(
+			sc_misfit,
+			ax=ax_misfit,
+			orientation="horizontal",
+			pad=COLORBAR_PAD,
+			fraction=COLORBAR_FRACTION,
+		)
 		cbar_mis.set_label("Pred - Obs (m)")
-	elif point_vals.size:
-		cbar_cov = fig.colorbar(sc_highlight, ax=ax_second, orientation="horizontal", pad=0.08)
-		cbar_cov.set_label("SSH Observed (m)")
 
 	fig.tight_layout()
 	out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,6 +605,8 @@ def _plot_map(
 	else:
 		vmin, vmax = _quantile_clamp(field)
 
+	cmap_pred = "coolwarm"
+
 	proj = None
 	if use_cartopy and ccrs is not None and cfeature is not None:
 		proj = ccrs.PlateCarree()
@@ -472,7 +616,7 @@ def _plot_map(
 		 lat_vals,
 		 field,
 		 transform=proj,
-		 cmap="viridis",
+		 cmap=cmap_pred,
 		 vmin=vmin,
 		 vmax=vmax,
 		)
@@ -487,7 +631,7 @@ def _plot_map(
 		 lon_vals,
 		 lat_vals,
 		 field,
-		 cmap="viridis",
+		 cmap=cmap_pred,
 		 shading="auto",
 		 vmin=vmin,
 		 vmax=vmax,
@@ -497,8 +641,14 @@ def _plot_map(
 		ax.set_ylabel("Latitude (deg)")
 		ax.grid(True, linewidth=0.4, alpha=0.35)
 
-	cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", pad=0.08)
-	cbar.set_label("SSH (m)")
+	cbar = fig.colorbar(
+		mesh,
+		ax=ax,
+		orientation="horizontal",
+		pad=COLORBAR_PAD,
+		fraction=COLORBAR_FRACTION,
+	)
+	cbar.set_label("SSHA (m)")
 
 	if overlays:
 		_apply_overlays(ax, overlays, proj, vmin, vmax)
@@ -563,7 +713,7 @@ def _apply_overlays(
 			scatter_kwargs.update(
 			 {
 			  "c": values if values is not None else None,
-			  "cmap": item.get("cmap", "viridis"),
+			  "cmap": item.get("cmap", "coolwarm"),
 			  "vmin": vmin,
 			  "vmax": vmax,
 			  "s": float(item.get("size", 6.0)),
@@ -640,6 +790,8 @@ def _build_overlays(
  alpha: float,
  linewidth: float,
  show_labels: bool,
+ scatter_size: float = COVERAGE_SCATTER_SIZE,
+ scatter_alpha: float = COVERAGE_SCATTER_ALPHA,
  cache: dict[Path, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
 	records_list = list(records)
@@ -718,12 +870,13 @@ def _build_overlays(
 		  "lat": lat_cat,
 		  "lon": lon_cat,
 		  "values": val_cat,
-		  "alpha": min(alpha, 0.85),
-		  "size": 10.0,
-		  "cmap": "viridis",
+		  "alpha": float(scatter_alpha),
+		  "size": float(scatter_size),
+		  "cmap": "coolwarm",
 		  "scatter_kwargs": {
-		   "edgecolors": "k",
-		   "linewidths": 0.2,
+		   "edgecolors": "none",
+		   "linewidths": 0.0,
+		   "marker": ".",
 		  },
 		 }
 		)
@@ -732,6 +885,13 @@ def _build_overlays(
 		 "lon": lon_cat,
 		 "values": val_cat,
 		 "time": time_cat if time_cat is not None else None,
+		 "style": {
+		  "size": float(scatter_size),
+		  "alpha": float(scatter_alpha),
+		  "marker": ".",
+		  "linewidths": 0.0,
+		  "edgecolors": "none",
+		 },
 		}
 
 	return overlays, point_data
@@ -743,9 +903,20 @@ def _make_animation(frame_paths: list[Path], out_path: Path, fps: float) -> bool
 		return False
 	if not frame_paths:
 		return False
-	duration = 1.0 / max(fps, 1e-6)
+	try:
+		fps_val = float(fps)
+	except (TypeError, ValueError):
+		fps_val = None
+	if fps_val is None or not np.isfinite(fps_val) or fps_val <= 0:
+		frame_delay_ms = 1000
+	else:
+		frame_delay_ms = max(int(round(1000.0 / fps_val)), 1)
 	images = [imageio.imread(path) for path in frame_paths]
-	imageio.mimsave(out_path, images, duration=duration)
+	per_frame_duration = [frame_delay_ms] * len(images)
+	try:
+		imageio.mimsave(out_path, images, duration=per_frame_duration, loop=0)
+	except TypeError:
+		imageio.mimsave(out_path, images, duration=frame_delay_ms, loop=0)
 	return True
 
 
@@ -756,6 +927,10 @@ def main() -> None:
 	parser.add_argument("--metrics", help="Optional metrics file location.")
 	parser.add_argument("--output", default="gulf_map.png", help="Output PNG path.")
 	parser.add_argument("--device", default="cpu", help="Device for inference (cpu, mps, cuda:0, ...).")
+	parser.add_argument(
+		"--grid-csv",
+		help="Optional CSV with 'lat' and 'lon' columns defining evaluation points (overrides --lat-range/--lon-range/--resolution).",
+	)
 	parser.add_argument("--lat-range", nargs=2, type=float, default=[18.0, 31.0], help="Lat bounds (deg).")
 	parser.add_argument("--lon-range", nargs=2, type=float, default=[-98.0, -80.0], help="Lon bounds (deg).")
 	parser.add_argument("--resolution", type=float, default=0.1, help="Grid step in degrees.")
@@ -815,12 +990,12 @@ def main() -> None:
 	parser.add_argument(
 	 "--show-misfit",
 	 action="store_true",
-	 help="Render a second panel with prediction minus shard residuals.",
+		help="Render an additional panel with prediction minus shard residuals.",
 	)
 	parser.add_argument(
-	 "--show-coverage-highlight",
-	 action="store_true",
-	 help="Render a second panel that highlights shard coverage versus the full prediction.",
+		"--show-coverage-highlight",
+		action="store_true",
+		help="Render an additional panel that overlays ground-truth shard coverage versus the prediction.",
 	)
 	parser.add_argument(
 	 "--misfit-limits",
@@ -848,8 +1023,8 @@ def main() -> None:
 	parser.add_argument(
 	 "--fps",
 	 type=float,
-	 default=6.0,
-	 help="Frames per second for the animation when --animate is provided.",
+	 default=1.0,
+	 help="Frames per second for the animation when --animate is provided (lower slows playback).",
 	)
 	args = parser.parse_args()
 
@@ -862,14 +1037,24 @@ def main() -> None:
 	device = torch.device(args.device)
 	lit_model, datamodule = _load_model(cfg, ckpt_path, device)
 
-	lat_min, lat_max = sorted(args.lat_range)
-	lon_min, lon_max = sorted(args.lon_range)
-	step = float(args.resolution)
-	if step <= 0:
-		raise ValueError("resolution must be positive")
+	if args.grid_csv:
+		grid_spec = _load_grid_csv(Path(args.grid_csv))
+	else:
+		lat_min, lat_max = sorted(args.lat_range)
+		lon_min, lon_max = sorted(args.lon_range)
+		step = float(args.resolution)
+		if step <= 0:
+			raise ValueError("resolution must be positive")
+		lat_vals = np.arange(lat_min, lat_max + step, step, dtype=np.float32)
+		lon_vals = np.arange(lon_min, lon_max + step, step, dtype=np.float32)
+		grid_spec = _make_rect_grid(lat_vals, lon_vals)
 
-	lat_vals = np.arange(lat_min, lat_max + step, step, dtype=np.float32)
-	lon_vals = np.arange(lon_min, lon_max + step, step, dtype=np.float32)
+	lat_vals = grid_spec.lat_values
+	lon_vals = grid_spec.lon_values
+	lat_min = float(np.min(lat_vals))
+	lat_max = float(np.max(lat_vals))
+	lon_min = float(np.min(lon_vals))
+	lon_max = float(np.max(lon_vals))
 
 	stats_time = _get(datamodule.stats, "time") if hasattr(datamodule, "stats") else None
 	time_default = float(stats_time.get("mean", 0.0)) if isinstance(stats_time, Mapping) else None
@@ -907,9 +1092,6 @@ def main() -> None:
 	coverage_cache: dict[Path, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
 	show_misfit = bool(args.show_misfit)
 	show_highlight = bool(args.show_coverage_highlight)
-	if show_misfit and show_highlight:
-		print("Both show-misfit and show-coverage-highlight requested; prioritising misfit view.")
-		show_highlight = False
 
 	if args.coverage_dir:
 		coverage_dir = Path(args.coverage_dir).expanduser().resolve()
@@ -960,13 +1142,32 @@ def main() -> None:
 	frame_paths: list[Path] = []
 	for idx, ts in enumerate(time_values):
 		context = time_contexts[idx] if idx < len(time_contexts) else None
-		field = _evaluate_grid(
-		 lit_model,
-		 lat_vals,
-		 lon_vals,
-		 ts,
-		 chunk_size=max(int(args.chunk_size), 1),
-		)
+		chunk = max(int(args.chunk_size), 1)
+		if grid_spec.is_complete_mesh:
+			field = _evaluate_grid(
+				lit_model,
+				lat_vals,
+				lon_vals,
+				ts,
+				chunk_size=chunk,
+			)
+		else:
+			if grid_spec.point_times is not None:
+				# Respect per-point timestamps supplied in the CSV when available.
+				point_time = grid_spec.point_times
+			elif ts is not None:
+				point_time = np.full(grid_spec.point_count, ts, dtype=np.float32)
+			else:
+				point_time = None
+			pred_points = _evaluate_points(
+				lit_model,
+				grid_spec.lat_points,
+				grid_spec.lon_points,
+				point_time,
+				chunk_size=chunk,
+			)
+			field = np.full((lat_vals.size, lon_vals.size), np.nan, dtype=np.float32)
+			field[grid_spec.lat_indices, grid_spec.lon_indices] = pred_points.astype(np.float32, copy=False)
 
 		overlays: list[dict[str, Any]] | None = None
 		point_data: dict[str, Any] | None = None
@@ -1010,7 +1211,7 @@ def main() -> None:
 			else:
 				frame_path = out_dir / f"{stem}_{idx:03d}{suffix}"
 
-		title_bits = ["Poseidon SSH", _format_timestamp(ts)]
+		title_bits = ["Poseidon SSHA", _format_timestamp(ts)]
 		if context and context.get("record"):
 			rec = context["record"]
 			cycle = rec.get("cycle")

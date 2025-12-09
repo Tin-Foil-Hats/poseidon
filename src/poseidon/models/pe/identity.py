@@ -9,17 +9,27 @@ from .utils import FeatureBuilder
 class PEIdentity(PEBase):
     """Pass-through encoder that exposes raw lat/lon (+ optional time)."""
 
-    def __init__(self, include_time: bool = True, time_fill: float = 0.0):
+    def __init__(
+        self,
+        include_time: bool = True,
+        time_fill: float = 0.0,
+        lat_scale: float = 1.0,
+        lon_scale: float = 1.0,
+        time_scale: float = 1.0,
+    ) -> None:
         super().__init__()
         self.include_time = bool(include_time)
         self.time_fill = float(time_fill)
+        self.lat_scale = float(lat_scale)
+        self.lon_scale = float(lon_scale)
+        self.time_scale = float(time_scale)
 
     def feat_dim(self) -> int:
         return 2 + (1 if self.include_time else 0)
 
     def forward(self, lat_deg, lon_deg, t_sec=None):
-        lat = lat_deg.float()
-        lon = lon_deg.float()
+        lat = lat_deg.float() * self.lat_scale
+        lon = lon_deg.float() * self.lon_scale
         builder = FeatureBuilder()
         builder.add_space(lat[..., None])
         builder.add_space(lon[..., None])
@@ -29,6 +39,7 @@ class PEIdentity(PEBase):
                 t = lat.new_full(lat.shape, self.time_fill)
             else:
                 t = t_sec.float()
+            t = t * self.time_scale
             builder.add_time(t[..., None])
 
         self._layout_cache = builder.layout()

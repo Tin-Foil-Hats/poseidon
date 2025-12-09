@@ -5,8 +5,13 @@ import torch.nn as nn
 import lightning.pytorch as L
 
 from poseidon.data.transforms import TargetNormalizer
+from poseidon.metrics import laplacian_penalty
 from poseidon.models.poseidon_model import build_model
 from poseidon.training.lr_schedulers import LinearWarmupCosineAnnealingLR
+from poseidon.training.sample_weighting import (
+    compute_loss_weights,
+    prepare_loss_weight_config,
+)
 
 class LitRegressor(L.LightningModule):
     """Lightning module wrapping Poseidon models with gradient diagnostics."""
@@ -20,9 +25,12 @@ class LitRegressor(L.LightningModule):
         if isinstance(cfg, dict):
             self.optim_cfg = dict(cfg.get("optim", {}))
             self.reg_cfg = dict(cfg.get("regularization", {}))
+            training_cfg = cfg.get("training") if isinstance(cfg.get("training"), dict) else {}
+            self.loss_weight_cfg = prepare_loss_weight_config(training_cfg.get("loss_weights"))
         else:
             self.optim_cfg = {}
             self.reg_cfg = {}
+            self.loss_weight_cfg = None
         self.use_ema = bool(self.optim_cfg.get("ema", False))
         self.ema_decay = float(self.optim_cfg.get("ema_decay", 0.999))
         self.target_normalizer = TargetNormalizer.from_dict((dm_stats or {}).get("target"))
@@ -55,12 +63,30 @@ class LitRegressor(L.LightningModule):
         else:
             pred_for_loss = pred_raw
             target_for_loss = y_raw
-        loss = self.loss_fn(pred_for_loss, target_for_loss).mean()
+        per_sample_loss = self.loss_fn(pred_for_loss, target_for_loss).reshape(-1)
+        weights = compute_loss_weights(
+            self.loss_weight_cfg,
+            batch,
+            device=per_sample_loss.device,
+            stage="train",
+        )
+        if weights is not None:
+            if weights.numel() != per_sample_loss.numel():
+                raise ValueError("Loss weight size mismatch with batch size")
+            per_sample_loss = per_sample_loss * weights.reshape_as(per_sample_loss)
+        loss = per_sample_loss.mean()
 
                                                                              
         lap_w = float(self.reg_cfg.get("laplace_weight", 0.0))
         if lap_w > 0.0:
-            lap_pen = self._laplacian_penalty(lat, lon, pred_physical)
+            lap_pen = laplacian_penalty(
+                lat,
+                lon,
+                pred_physical,
+                max_points=int(self.reg_cfg.get("laplace_max_points", 512)),
+                k=int(self.reg_cfg.get("laplace_k", 8)),
+                length_km=float(self.reg_cfg.get("laplace_length_km", 50.0)),
+            )
             loss = loss + lap_w * lap_pen
             self.log(
                 "train_laplace_penalty",
@@ -138,7 +164,18 @@ class LitRegressor(L.LightningModule):
         else:
             pred_for_loss = pred_raw
             target_for_loss = y_raw
-        loss = self.loss_fn(pred_for_loss, target_for_loss).mean()
+        per_sample_loss = self.loss_fn(pred_for_loss, target_for_loss).reshape(-1)
+        weights = compute_loss_weights(
+            self.loss_weight_cfg,
+            batch,
+            device=per_sample_loss.device,
+            stage="validate",
+        )
+        if weights is not None:
+            if weights.numel() != per_sample_loss.numel():
+                raise ValueError("Loss weight size mismatch with batch size")
+            per_sample_loss = per_sample_loss * weights.reshape_as(per_sample_loss)
+        loss = per_sample_loss.mean()
         batch_size = max(int(y_raw.numel()), 1)
         self.log("val_loss", loss, prog_bar=True, sync_dist=False, batch_size=batch_size)
 
@@ -179,7 +216,18 @@ class LitRegressor(L.LightningModule):
         else:
             pred_for_loss = pred_raw
             target_for_loss = y_raw
-        loss = self.loss_fn(pred_for_loss, target_for_loss).mean()
+        per_sample_loss = self.loss_fn(pred_for_loss, target_for_loss).reshape(-1)
+        weights = compute_loss_weights(
+            self.loss_weight_cfg,
+            batch,
+            device=per_sample_loss.device,
+            stage="test",
+        )
+        if weights is not None:
+            if weights.numel() != per_sample_loss.numel():
+                raise ValueError("Loss weight size mismatch with batch size")
+            per_sample_loss = per_sample_loss * weights.reshape_as(per_sample_loss)
+        loss = per_sample_loss.mean()
         batch_size = max(int(y_raw.numel()), 1)
         self.log("test_loss", loss, prog_bar=True, sync_dist=False, batch_size=batch_size)
 
@@ -378,54 +426,4 @@ class LitRegressor(L.LightningModule):
 
         raise ValueError(f"Unknown schedule: {kind}")
 
-    def _laplacian_penalty(self, lat_deg: torch.Tensor, lon_deg: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-        """Approximate Laplacian smoothness on an irregular batch via kNN graph.
 
-        Encourages local isotropy (reduces along-track striping) while keeping
-        mesoscale/submesoscale detail by limiting the neighbourhood and length scale.
-        """
-        max_pts = int(self.reg_cfg.get("laplace_max_points", 512))
-        k = int(self.reg_cfg.get("laplace_k", 8))
-        length_km = float(self.reg_cfg.get("laplace_length_km", 50.0))
-        eps = 1e-6
-
-                                                                   
-        lat = lat_deg.reshape(-1)
-        lon = lon_deg.reshape(-1)
-        vals = values.reshape(-1)
-        n = lat.numel()
-        if n == 0:
-            return torch.tensor(0.0, device=lat.device, dtype=lat.dtype)
-        if n > max_pts:
-            idx = torch.randperm(n, device=lat.device)[:max_pts]
-            lat, lon, vals = lat[idx], lon[idx], vals[idx]
-            n = lat.numel()
-        if n <= 1 or k <= 0:
-            return torch.tensor(0.0, device=lat.device, dtype=lat.dtype)
-
-                                                                      
-        lat_r = torch.deg2rad(lat)
-        lon_r = torch.deg2rad(lon)
-        cos_lat = torch.cos(lat_r)
-        x = cos_lat * torch.cos(lon_r)
-        y = cos_lat * torch.sin(lon_r)
-        z = torch.sin(lat_r)
-        coords = torch.stack((x, y, z), dim=1)
-        chord = torch.cdist(coords, coords)          
-                                                                      
-        arc = 2.0 * 6371.0 * torch.asin(torch.clamp(chord * 0.5, max=1.0))
-
-                                            
-        k_eff = min(k + 1, n)
-        dist, idx = torch.topk(arc, k=k_eff, largest=False)
-        dist = dist[:, 1:]             
-        idx = idx[:, 1:]
-
-        neighbor_vals = vals[idx]
-        center_vals = vals.unsqueeze(1)
-        diff = center_vals - neighbor_vals
-                                                                          
-        denom = (dist + eps) ** 2
-        weights = torch.exp(-(dist / max(length_km, eps)) ** 2)
-        penalty = (weights * (diff * diff) / denom).mean()
-        return penalty

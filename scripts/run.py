@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import itertools
+import math
 import os
 import re
 import time
@@ -22,6 +23,17 @@ from poseidon.training import LitRegressor, SetEpochOnIterable, create_datamodul
 def _slug(text: str) -> str:
     """Convert arbitrary text into a filesystem-safe slug."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-") or "run"
+
+
+def _fmt_value(value: Any) -> str:
+    """Format numbers for inclusion in run-directory tokens."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "nan"
+        return str(int(value)) if value.is_integer() else f"{value:g}"
+    return _slug(str(value))
 
 
 def _section(cfg: Mapping[str, Any], key: str) -> Dict[str, Any]:
@@ -180,13 +192,146 @@ def _arch_subdir(cfg: Mapping[str, Any]) -> str:
             parts.append(f"{prefix}D{depth}" if prefix else f"D{depth}")
         return width is not None or depth is not None
 
+    def _append_omega_tokens(prefix: str, block: Mapping[str, Any] | Any) -> None:
+        if not isinstance(block, Mapping):
+            return
+        omega_initial = block.get("omega0_initial")
+        if omega_initial is None and block.get("omega0") is not None:
+            omega_initial = block.get("omega0")
+        if omega_initial is not None:
+            token = f"{prefix}Oi{_fmt_value(omega_initial)}" if prefix else f"Oi{_fmt_value(omega_initial)}"
+            parts.append(token)
+        omega_hidden = block.get("omega0_hidden")
+        if omega_hidden is not None:
+            token = f"{prefix}Oh{_fmt_value(omega_hidden)}" if prefix else f"Oh{_fmt_value(omega_hidden)}"
+            parts.append(token)
+
     recorded = False
     recorded |= _append_dims("S", net.get("space_net"))
     recorded |= _append_dims("T", net.get("time_net"))
     if not recorded:
         _append_dims("", net)
 
+    _append_omega_tokens("S", net.get("space_net"))
+    _append_omega_tokens("T", net.get("time_net"))
+    _append_omega_tokens("", net)
+
+    parts.extend(_pe_tokens(pe_type, pe))
+    parts.extend(_loss_weight_tokens(cfg))
+    parts.extend(_data_loader_tokens(_section(cfg, "data")))
+    parts.extend(_regularization_tokens(_section(cfg, "regularization")))
+
     return _slug("_".join(parts)) if parts else ""
+
+
+def _pe_tokens(pe_type: str, pe_cfg: Mapping[str, Any]) -> list[str]:
+    """Create naming tokens for positional encoder hyperparameters."""
+    tokens: list[str] = []
+    if not isinstance(pe_cfg, Mapping):
+        return tokens
+
+    if pe_type == "fourier_physical":
+        spatial_scales = pe_cfg.get("spatial_scales_km")
+        if isinstance(spatial_scales, Sequence) and not isinstance(spatial_scales, (str, bytes)):
+            values = [float(s) for s in spatial_scales if isinstance(s, (int, float))]
+            if values:
+                tokens.append(f"FpS{len(values)}")
+                tokens.append(f"FpSmin{_fmt_value(min(values))}")
+                tokens.append(f"FpSmax{_fmt_value(max(values))}")
+
+        time_scales = pe_cfg.get("time_scales_hours")
+        if isinstance(time_scales, Sequence) and not isinstance(time_scales, (str, bytes)):
+            values = [float(s) for s in time_scales if isinstance(s, (int, float))]
+            if values:
+                tokens.append(f"FpT{len(values)}")
+                tokens.append(f"FpTmax{_fmt_value(max(values))}")
+
+        time_norm = pe_cfg.get("time_norm")
+        if time_norm:
+            tokens.append(f"FpTn{_slug(str(time_norm))}")
+
+        include_xyz = pe_cfg.get("include_xyz")
+        if include_xyz is not None:
+            tokens.append("FpXYZ" if bool(include_xyz) else "FpNoXYZ")
+
+    elif pe_type == "fourier_physical_random":
+        spatial_features = pe_cfg.get("spatial_features")
+        temporal_features = pe_cfg.get("temporal_features")
+        if spatial_features is not None:
+            tokens.append(f"FpRS{_fmt_value(spatial_features)}")
+        if temporal_features is not None:
+            tokens.append(f"FpRT{_fmt_value(temporal_features)}")
+
+    return tokens
+
+
+def _loss_weight_tokens(cfg: Mapping[str, Any]) -> list[str]:
+    """Extract loss-weight hyperparameters for directory naming."""
+    training = _section(cfg, "training")
+    weights = training.get("loss_weights") if isinstance(training.get("loss_weights"), Mapping) else None
+    if not isinstance(weights, Mapping):
+        return []
+
+    tokens: list[str] = []
+
+    dist_cfg = weights.get("distance_to_coast")
+    if isinstance(dist_cfg, Mapping):
+        method = str(dist_cfg.get("method", "")).lower()
+        value = None
+        if method == "exp":
+            value = dist_cfg.get("scale_km")
+        elif method == "linear":
+            value = dist_cfg.get("max_km") or dist_cfg.get("scale_km")
+        else:
+            value = dist_cfg.get("scale_km") or dist_cfg.get("max_km")
+        if value is not None:
+            tokens.append(f"dist_km{_fmt_value(value)}")
+
+    cross_cfg = weights.get("cross_track_distance")
+    if isinstance(cross_cfg, Mapping):
+        value = cross_cfg.get("sigma_km")
+        if value is None:
+            value = cross_cfg.get("scale_km") or cross_cfg.get("max_km")
+        if value is not None:
+            tokens.append(f"cross_km{_fmt_value(value)}")
+
+    return tokens
+
+
+def _data_loader_tokens(cfg: Mapping[str, Any]) -> list[str]:
+    """Capture data-loader modifiers for directory naming."""
+    tokens: list[str] = []
+    if not isinstance(cfg, Mapping):
+        return tokens
+    loader = cfg.get("train_loader")
+    if loader:
+        tokens.append(f"DL{_slug(str(loader))}")
+    micro = cfg.get("train_micro_bs")
+    if isinstance(micro, (int, float)) and micro not in (0, None):
+        tokens.append(f"DLm{_fmt_value(micro)}")
+    if cfg.get("train_files_are_batches"):
+        tokens.append("DLFileBatch")
+    return tokens
+
+
+def _regularization_tokens(cfg: Mapping[str, Any]) -> list[str]:
+    """Capture regularization hyperparameters for directory naming."""
+    tokens: list[str] = []
+    if not isinstance(cfg, Mapping):
+        return tokens
+    laplace_weight = cfg.get("laplace_weight")
+    if isinstance(laplace_weight, (int, float)) and laplace_weight > 0:
+        tokens.append(f"LapW{_fmt_value(laplace_weight)}")
+        laplace_len = cfg.get("laplace_length_km")
+        if laplace_len is not None:
+            tokens.append(f"LapL{_fmt_value(laplace_len)}")
+        laplace_k = cfg.get("laplace_k")
+        if laplace_k is not None:
+            tokens.append(f"LapK{_fmt_value(laplace_k)}")
+        laplace_max = cfg.get("laplace_max_points")
+        if laplace_max is not None:
+            tokens.append(f"LapN{_fmt_value(laplace_max)}")
+    return tokens
 
 
 def _resolve_path(path: os.PathLike[str] | str, *, base: Path | None = None) -> Path:

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Union
+from typing import Dict, Any, List, Tuple, Union, Optional
+import hashlib
 import json
 import random
 import re
@@ -125,6 +126,57 @@ def split_by_cycle_pass(
                 patched["length"] = int(patched["count"])   
         normalized.append(patched)
     return split_by_group(normalized, ("cycle", "pass"), val_ratio, test_ratio, seed=seed)
+
+
+def compute_index_signature(index: List[Dict[str, Any]]) -> str:
+    rows: List[str] = []
+    for item in index:
+        path = str(item.get("path", ""))
+        cycle = item.get("cycle")
+        pas = item.get("pass")
+        length = item.get("length")
+        rows.append(f"{path}|{cycle}|{pas}|{length}")
+    if not rows:
+        return "0"
+    rows.sort()
+    payload = "\n".join(rows).encode("utf-8", errors="ignore")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def save_split_cache(
+    path: Union[str, Path],
+    *,
+    splits: Dict[str, List[Dict[str, Any]]],
+    seed: int,
+    val_ratio: float,
+    test_ratio: float,
+    shards_dir: Union[str, Path],
+    index_signature: str,
+) -> Path:
+    payload = {
+        "meta": {
+            "seed": int(seed),
+            "val_ratio": float(val_ratio),
+            "test_ratio": float(test_ratio),
+            "shards_dir": str(Path(shards_dir).resolve()),
+            "index_signature": index_signature,
+        },
+        "splits": splits,
+    }
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload))
+    return out_path
+
+
+def load_split_cache(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    cache_path = Path(path)
+    if not cache_path.is_file():
+        return None
+    try:
+        return json.loads(cache_path.read_text())
+    except json.JSONDecodeError:
+        return None
 
 def _resolve_shard_path(candidate: Union[str, Path], root: Path) -> Path:
     path = Path(candidate)

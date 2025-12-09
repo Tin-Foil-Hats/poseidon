@@ -14,15 +14,25 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from poseidon.data.dataset import ShardedFlatDataset, PassShardDataset
-from poseidon.data.shards import load_index, split_by_cycle_pass
+from poseidon.data.shards import (
+    load_index,
+    split_by_cycle_pass,
+    compute_index_signature,
+    load_split_cache,
+    save_split_cache,
+)
 
 TimeStatsMode = Literal["none", "train", "all"]
 TrainLoaderMode = Literal["auto", "flat", "stream"]
 
 class _BatchShardIterable(IterableDataset):
-    """
-    Train iterator over pre-batched .pt shards.
-    Each file: {'X':[K,B,3], 'Y':[K,B,1]} with X[...,0]=lat, 1=lon, 2=t.
+    """Train iterator over pre-batched .pt shards.
+
+    Default format expects each file to contain ``{'X': [K,B,3], 'Y': [K,B,1]}``
+    so that a file provides ``K`` logical batches of ``B`` samples each. When
+    ``files_are_batches`` is enabled, every file is treated as a single batch
+    whose tensors are stored as ``[B, C]`` (no leading ``K`` dimension).
+
     Supports micro-batching and epoch-aware shuffling.
     """
 
@@ -34,6 +44,8 @@ class _BatchShardIterable(IterableDataset):
         shuffle_batches: bool = True,
         index_name: str = "batch_index.json",
         cache_files: bool = False,
+        augment_config: Dict[str, Any] | None = None,
+        files_are_batches: bool = False,
     ):
         super().__init__()
         self.dir = str(shard_dir)
@@ -46,13 +58,17 @@ class _BatchShardIterable(IterableDataset):
         self.shuffle_batches = bool(shuffle_batches)
         self.index_path = os.path.join(self.dir, index_name)
         self.cache_files = bool(cache_files)
+        self.augment_cfg = dict(augment_config) if augment_config else None
+        self.files_are_batches = bool(files_are_batches)
         self._cache: dict[str, dict[str, torch.Tensor]] = {}
+        self._extra_keys: list[str] = []
 
         self._batches_per_file = self._load_or_build_index()
 
         if self.micro_bs > 0:
             d0 = torch.load(self.paths[0], map_location="cpu")
-            B = int(d0["X"].shape[1]); del d0
+            B = self._infer_batch_width(d0["X"])
+            del d0
             chunks = max(B // self.micro_bs, 1)
             self._total = int(sum(self._batches_per_file) * chunks)
         else:
@@ -69,16 +85,24 @@ class _BatchShardIterable(IterableDataset):
 
     def _load_or_build_index(self):
         if os.path.isfile(self.index_path):
-            j = json.loads(open(self.index_path).read())
-            if j.get("paths") == self.paths:
+            with open(self.index_path) as f:
+                j = json.load(f)
+            if j.get("paths") == self.paths and bool(j.get("files_are_batches", False)) == self.files_are_batches:
                 return list(map(int, j["batches_per_file"]))
         counts = []
-        for p in self.paths:
-            d = torch.load(p, map_location="cpu")
-            counts.append(int(d["X"].shape[0]))      
-            del d
+        if self.files_are_batches:
+            counts = [1 for _ in self.paths]
+        else:
+            for p in self.paths:
+                d = torch.load(p, map_location="cpu")
+                counts.append(int(d["X"].shape[0]))
+                del d
         with open(self.index_path, "w") as f:
-            json.dump({"paths": self.paths, "batches_per_file": counts}, f)
+            json.dump({
+                "paths": self.paths,
+                "batches_per_file": counts,
+                "files_are_batches": self.files_are_batches,
+            }, f)
         return counts
 
     def __len__(self) -> int:
@@ -102,38 +126,123 @@ class _BatchShardIterable(IterableDataset):
             return
 
         for p in paths:
-            d = self._load_file(p)
-            X, Y = d["X"], d["Y"]                                     
-            K, B = X.shape[0], X.shape[1]
-
-            order = list(range(K))
-            if self.shuffle_batches:
-                rng.shuffle(order)
-
-            mb = self.micro_bs
-            if mb <= 0 or mb >= B:
-                for i in order:
-                    Xi, Yi = X[i], Y[i].view(-1)
-                    yield {
-                        "lat": Xi[:, 0].contiguous(),
-                        "lon": Xi[:, 1].contiguous(),
-                        "t":   Xi[:, 2].contiguous(),
-                        "y":   Yi.contiguous(),
-                    }
-            else:
-                phase = (rng.randrange(max(B // mb, 1)) * mb) if (B % mb == 0 and B // mb > 0) else 0
-                for i in order:
-                    Xi, Yi = X[i], Y[i].view(-1)
-                    for s in range(phase, phase + B, mb):
-                        a = s % B
+            data = self._load_file(p)
+            for Xi, Yi, extras in self._iter_file_batches(data, rng):
+                base_len = Xi.shape[0]
+                mb = self.micro_bs
+                if mb <= 0 or mb >= base_len:
+                    batch = self._build_batch(Xi, Yi, extras, rng)
+                    yield batch
+                else:
+                    steps = max(base_len // mb, 1)
+                    phase = (rng.randrange(steps) * mb) if (base_len % mb == 0 and steps > 0) else 0
+                    for s in range(phase, phase + base_len, mb):
+                        a = s % base_len
                         e = a + mb
-                        if e > B: break
-                        yield {
-                            "lat": Xi[a:e, 0].contiguous(),
-                            "lon": Xi[a:e, 1].contiguous(),
-                            "t":   Xi[a:e, 2].contiguous(),
-                            "y":   Yi[a:e].contiguous(),
-                        }
+                        if e > base_len:
+                            break
+                        extras_slice = self._slice_extras(extras, a, e, base_len)
+                        batch = self._build_batch(Xi[a:e], Yi[a:e], extras_slice, rng)
+                        yield batch
+
+    def _iter_file_batches(self, data: dict[str, torch.Tensor], rng: random.Random):
+        X, Y = data["X"], data["Y"]
+        if self.files_are_batches:
+            Xi = self._prepare_file_batch(X)
+            Yi = self._prepare_file_targets(Y)
+            extras = self._collect_extra_values(data, Xi.shape[0], None)
+            yield Xi, Yi, extras
+            return
+
+        if X.ndim < 2:
+            raise ValueError("Expected X to have shape [K,B,3] for batch shards")
+        K = X.shape[0]
+        order = list(range(K))
+        if self.shuffle_batches:
+            rng.shuffle(order)
+        for idx in order:
+            Xi = X[idx]
+            if Xi.ndim != 2:
+                raise ValueError("Batch tensor must be 2D [B, C]")
+            Yi = Y[idx].view(-1)
+            extras = self._collect_extra_values(data, Xi.shape[0], idx)
+            yield Xi, Yi, extras
+
+    def _prepare_file_batch(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        if tensor.ndim != 2:
+            raise ValueError("files_are_batches expects X shaped [B, C]")
+        return tensor
+
+    def _prepare_file_targets(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        if tensor.ndim == 2 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        return tensor.view(-1)
+
+    def _collect_extra_values(self, data: dict[str, torch.Tensor], base_len: int, batch_idx: int | None):
+        extras: dict[str, torch.Tensor] = {}
+        for key in self._extra_keys:
+            tensor = data.get(key)
+            if tensor is None or not torch.is_tensor(tensor):
+                continue
+            if self.files_are_batches or tensor.ndim <= 1:
+                values = tensor
+            else:
+                values = tensor[batch_idx]
+            if (
+                self.files_are_batches
+                and values.ndim >= 2
+                and values.shape[0] == 1
+                and values.shape[1] == base_len
+            ):
+                values = values[0]
+            if values.ndim > 1 and values.shape[-1] == 1:
+                values = values.squeeze(-1)
+            extras[key] = values
+        return extras
+
+    def _slice_extras(self, extras: dict[str, torch.Tensor], start: int | None, end: int | None, base_len: int):
+        if not extras:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        for key, value in extras.items():
+            if not torch.is_tensor(value):
+                out[key] = value
+                continue
+            if start is not None and end is not None and value.ndim >= 1 and value.shape[0] == base_len:
+                out[key] = value[start:end].contiguous()
+            else:
+                out[key] = value.contiguous()
+        return out
+
+    def _infer_batch_width(self, tensor: torch.Tensor) -> int:
+        if self.files_are_batches:
+            if tensor.ndim == 3 and tensor.shape[0] == 1:
+                return int(tensor.shape[1])
+            if tensor.ndim == 2:
+                return int(tensor.shape[0])
+            raise ValueError("Unable to infer batch width for files_are_batches format")
+        if tensor.ndim < 2:
+            raise ValueError("Batch shard tensor must be at least 2D")
+        return int(tensor.shape[1])
+
+    def _build_batch(self, Xi: torch.Tensor, Yi: torch.Tensor, extras: dict[str, torch.Tensor], rng: random.Random):
+        batch = {
+            "lat": Xi[:, 0].contiguous(),
+            "lon": Xi[:, 1].contiguous(),
+            "t": Xi[:, 2].contiguous(),
+            "y": Yi.contiguous(),
+        }
+        if extras:
+            for key, value in extras.items():
+                if value is None:
+                    continue
+                batch[key] = value if not torch.is_tensor(value) else value.contiguous()
+        batch = self._augment_batch(batch, rng)
+        return batch
 
     def _load_file(self, path: str) -> dict[str, torch.Tensor]:
         if self.cache_files:
@@ -141,9 +250,64 @@ class _BatchShardIterable(IterableDataset):
             if cached is not None:
                 return cached
         data = torch.load(path, map_location="cpu")
+        if not self._extra_keys:
+            self._extra_keys = [k for k in data.keys() if k not in {"X", "Y"}]
         if self.cache_files:
             self._cache[path] = data
         return data
+
+    def _augment_batch(self, batch: dict[str, torch.Tensor], rng: random.Random) -> dict[str, torch.Tensor]:
+        cfg = self.augment_cfg
+        if not cfg:
+            return batch
+
+        out = dict(batch)
+        lat = out["lat"]
+        lon = out["lon"]
+        t = out.get("t")
+        y = out["y"]
+
+        torch_rng = torch.Generator(device=lat.device)
+        torch_rng.manual_seed(rng.randrange(2**31))
+
+        lat_jitter = float(cfg.get("lat_jitter_deg", 0.0) or 0.0)
+        if lat_jitter > 0.0:
+            lat_noise = torch.randn(lat.shape, generator=torch_rng, device=lat.device, dtype=lat.dtype)
+            lat = lat + lat_noise * lat_jitter
+
+        lon_jitter = float(cfg.get("lon_jitter_deg", 0.0) or 0.0)
+        if lon_jitter > 0.0:
+            lon_noise = torch.randn(lon.shape, generator=torch_rng, device=lon.device, dtype=lon.dtype)
+            lon = lon + lon_noise * lon_jitter
+
+        time_jitter = float(cfg.get("time_jitter_seconds", 0.0) or 0.0)
+        if time_jitter > 0.0 and t is not None:
+            t_noise = torch.randn(t.shape, generator=torch_rng, device=t.device, dtype=t.dtype)
+            t = t + t_noise * time_jitter
+
+        value_jitter = float(cfg.get("value_jitter_std", 0.0) or 0.0)
+        if value_jitter > 0.0:
+            y_noise = torch.randn(y.shape, generator=torch_rng, device=y.device, dtype=y.dtype)
+            y = y + y_noise * value_jitter
+
+        dropout = float(cfg.get("sample_dropout", 0.0) or 0.0)
+        if dropout > 0.0:
+            keep_mask = torch.rand(lat.shape[0], generator=torch_rng, device=lat.device) > dropout
+            if keep_mask.sum().item() >= 1:
+                for key, value in list(out.items()):
+                    if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == keep_mask.shape[0]:
+                        out[key] = value[keep_mask].contiguous()
+                lat = out["lat"]
+                lon = out["lon"]
+                y = out["y"]
+                t = out.get("t")
+
+        out["lat"] = lat.contiguous()
+        out["lon"] = lon.contiguous()
+        out["y"] = y.contiguous()
+        if t is not None:
+            out["t"] = t.contiguous()
+        return out
 
 
 
@@ -158,12 +322,15 @@ class ShardedDataModule(LightningDataModule):
         test_ratio: float = 0.1,
         seed: int = 42,
         time_stats: TimeStatsMode = "train",
+        split_cache_path: Optional[str] = None,
+        split_cache_auto_write: bool = True,
 
         train_batchshard_dir: Optional[str] = None,
         train_micro_bs: int = 0,                                                           
         target_normalizer: Optional[Dict[str, Any]] = None,
         train_num_workers: Optional[int] = None,
         train_cache_shards: bool = False,
+        train_files_are_batches: bool = False,
         val_full_pass: bool = False,
         test_full_pass: bool = False,
         preload_npz: bool = False,
@@ -171,6 +338,7 @@ class ShardedDataModule(LightningDataModule):
         val_chunk_size: int = 0,
         test_chunk_size: int = 0,
         train_time_scan_files: int | None = None,
+        train_augmentations: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.shards_dir = Path(shards_dir).resolve()                      
@@ -181,11 +349,14 @@ class ShardedDataModule(LightningDataModule):
         self.test_ratio = test_ratio
         self.seed = seed
         self.time_stats: TimeStatsMode = time_stats
+        self.split_cache_path = Path(split_cache_path) if split_cache_path else None
+        self.split_cache_auto_write = bool(split_cache_auto_write)
 
         self.train_batchshard_dir = Path(train_batchshard_dir).resolve() if train_batchshard_dir else None
         self.train_micro_bs = int(train_micro_bs)
         self.train_num_workers = int(train_num_workers) if train_num_workers is not None else None
         self.train_cache_shards = bool(train_cache_shards)
+        self.train_files_are_batches = bool(train_files_are_batches)
         self.val_full_pass = bool(val_full_pass)
         self.test_full_pass = bool(test_full_pass)
         self.preload_npz = bool(preload_npz)
@@ -195,6 +366,7 @@ class ShardedDataModule(LightningDataModule):
         self.val_chunk_size = int(val_chunk_size)
         self.test_chunk_size = int(test_chunk_size)
         self.train_time_scan_files = None if train_time_scan_files in (None, -1) else int(train_time_scan_files)
+        self.train_augmentations = dict(train_augmentations) if isinstance(train_augmentations, dict) else None
 
         tn_cfg = target_normalizer if target_normalizer is not None else {"type": "none"}
         if isinstance(tn_cfg, str):
@@ -241,6 +413,54 @@ class ShardedDataModule(LightningDataModule):
                 e2["path"] = str(self._resolve(e2["path"]))
             out.append(e2)
         return out
+
+    def _split_cache_resolved(self) -> Optional[Path]:
+        if self.split_cache_path is None:
+            return None
+        return self._resolve(self.split_cache_path)
+
+    def _load_cached_splits(self, index_signature: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        cache_path = self._split_cache_resolved()
+        if cache_path is None:
+            return None
+        payload = load_split_cache(cache_path)
+        if not payload:
+            return None
+        meta = payload.get("meta") or {}
+        if int(meta.get("seed", -1)) != int(self.seed):
+            return None
+        if float(meta.get("val_ratio", -1.0)) != float(self.val_ratio):
+            return None
+        if float(meta.get("test_ratio", -1.0)) != float(self.test_ratio):
+            return None
+        cached_dir = meta.get("shards_dir")
+        expected_dir = str(self.shards_dir.resolve())
+        if cached_dir and str(Path(cached_dir).resolve()) != expected_dir:
+            return None
+        if meta.get("index_signature") != index_signature:
+            return None
+        splits = payload.get("splits")
+        if not isinstance(splits, dict):
+            return None
+        if not all(k in splits for k in ("train", "val", "test")):
+            return None
+        print(f"[ShardedDataModule] Loaded split cache from {cache_path}")
+        return splits
+
+    def _maybe_save_split_cache(self, splits: Dict[str, List[Dict[str, Any]]], index_signature: str) -> None:
+        cache_path = self._split_cache_resolved()
+        if cache_path is None or not self.split_cache_auto_write:
+            return
+        save_split_cache(
+            cache_path,
+            splits=splits,
+            seed=self.seed,
+            val_ratio=self.val_ratio,
+            test_ratio=self.test_ratio,
+            shards_dir=self.shards_dir,
+            index_signature=index_signature,
+        )
+        print(f"[ShardedDataModule] Saved split cache to {cache_path}")
 
     def _scan_bbox_npz(self, shard_paths):
         lat_min, lat_max = +np.inf, -np.inf
@@ -392,7 +612,11 @@ class ShardedDataModule(LightningDataModule):
             raise FileNotFoundError(f"Shard directory not found: {self.shards_dir}")
 
         index = load_index(self.shards_dir)
-        splits = split_by_cycle_pass(index, val_ratio=self.val_ratio, test_ratio=self.test_ratio, seed=self.seed)
+        index_signature = compute_index_signature(index)
+        splits = self._load_cached_splits(index_signature)
+        if splits is None:
+            splits = split_by_cycle_pass(index, val_ratio=self.val_ratio, test_ratio=self.test_ratio, seed=self.seed)
+            self._maybe_save_split_cache(splits, index_signature)
         splits_norm = {
             "train": self._abs_split(splits["train"]),
             "val":   self._abs_split(splits["val"]),
@@ -415,7 +639,9 @@ class ShardedDataModule(LightningDataModule):
             self.train_ds = _BatchShardIterable(
                 str(self.train_batchshard_dir), micro_bs=self.train_micro_bs,
                 shuffle_files=True, shuffle_batches=True,
-                cache_files=self.train_cache_shards
+                cache_files=self.train_cache_shards,
+                augment_config=self.train_augmentations,
+                files_are_batches=self.train_files_are_batches,
             )
         else:
             self.train_ds = ShardedFlatDataset(splits_norm["train"], preload=self.preload_npz)
@@ -611,11 +837,14 @@ def create_datamodule_from_config(cfg: Dict[str, Any]):
         test_ratio=d.get("test_ratio", 0.1),
         seed=d.get("seed", 42),
         time_stats=d.get("time_stats", "train"),
+        split_cache_path=d.get("split_cache_path"),
+        split_cache_auto_write=d.get("split_cache_auto_write", True),
         train_batchshard_dir=d.get("train_batchshard_dir", None),
         train_micro_bs=d.get("train_micro_bs", 0),
         target_normalizer=d.get("target_normalizer"),
         train_num_workers=d.get("train_num_workers", None),
         train_cache_shards=d.get("train_cache_shards", False),
+        train_files_are_batches=d.get("train_files_are_batches", False),
         val_full_pass=d.get("val_full_pass", False),
         test_full_pass=d.get("test_full_pass", False),
         preload_npz=d.get("preload_npz", False),
@@ -623,4 +852,5 @@ def create_datamodule_from_config(cfg: Dict[str, Any]):
         val_chunk_size=d.get("val_chunk_size", 0),
         test_chunk_size=d.get("test_chunk_size", 0),
         train_time_scan_files=d.get("train_time_scan_files"),
+        train_augmentations=d.get("train_augmentations"),
     )

@@ -56,3 +56,7 @@ configs/**/*.json
 
 # Any exposure of sensitive information
 *.sbatch
+z_batch_scripts/
+*.csv
+cmems_gulf_coords.csv
+notebooks/distance_weight_histograms.ipynb

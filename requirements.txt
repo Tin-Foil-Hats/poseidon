@@ -21,6 +21,7 @@ cartopy
 tqdm
 psutil
 pynvml
+optuna
 
 # Visualization and notebooks
 matplotlib

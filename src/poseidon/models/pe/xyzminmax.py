@@ -26,12 +26,19 @@ class PEXyzMinMax(PEBase):
         include_time: bool = True,
         time_norm: str = "minmax",
         spatial_steps: int = 128,
+        time_cycles_per_year: tuple[float, ...] | None = None,
+        time_cycle_period_days: float = 365.2425,
     ):
         super().__init__()
         self.radius = float(radius)
         self.include_time = bool(include_time)
         self.time_norm = str(time_norm).lower()
         self.spatial_steps = max(int(spatial_steps), 8)
+        if not self.include_time:
+            time_cycles_per_year = ()
+        cycles = tuple(float(freq) for freq in (time_cycles_per_year or ()))
+        self.time_cycles: tuple[float, ...] = tuple(freq for freq in cycles if abs(freq) > 0.0)
+        self.time_cycle_period_sec = max(float(time_cycle_period_days) * 86400.0, 1.0)
         self._time_stats: dict | None = None
         self._layout_cache: dict | None = None
         self._spatial_bounds: Dict[str, Tuple[float, float]] | None = None
@@ -62,7 +69,9 @@ class PEXyzMinMax(PEBase):
         }
 
     def feat_dim(self) -> int:
-        return 3 + (1 if self.include_time else 0)
+        if not self.include_time:
+            return 3
+        return 3 + 1 + 2 * len(self.time_cycles)
 
     def forward(
         self,
@@ -92,7 +101,6 @@ class PEXyzMinMax(PEBase):
 
         if self.include_time:
             if t_sec is None:
-                                                                             
                 t_sec = torch.zeros_like(lat, dtype=torch.float32)
             t_scaled = time_normalize(t_sec.float(), self.time_norm, self._time_stats)
             if t_scaled is None:
@@ -100,6 +108,22 @@ class PEXyzMinMax(PEBase):
             if t_scaled.dim() == coords.dim() - 1:
                 t_scaled = t_scaled.unsqueeze(-1)
             builder.add_time(t_scaled)
+
+            if self.time_cycles:
+                if self._time_stats is not None and "mean" in self._time_stats:
+                    center = float(self._time_stats.get("mean", 0.0))
+                else:
+                    center = 0.0
+                t_centered = t_sec.float() - center
+                base = t_centered / self.time_cycle_period_sec
+                two_pi = 2.0 * math.pi
+                cycle_terms = []
+                for freq in self.time_cycles:
+                    phase = base * (two_pi * freq)
+                    cycle_terms.append(torch.sin(phase))
+                    cycle_terms.append(torch.cos(phase))
+                cycle_tensor = torch.stack(cycle_terms, dim=-1)
+                builder.add_time(cycle_tensor)
 
         features = builder.build()
         self._layout_cache = builder.layout()
@@ -109,7 +133,7 @@ class PEXyzMinMax(PEBase):
         if self._layout_cache is None:
             layout: dict[str, int | list[str]] = {"space": 3, "order": ["space"], "full": self.feat_dim()}
             if self.include_time:
-                layout["time"] = 1
+                layout["time"] = 1 + 2 * len(self.time_cycles)
                 layout["order"].append("time")
             return layout
         return dict(self._layout_cache)

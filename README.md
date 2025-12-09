@@ -66,6 +66,7 @@ pip install -e .
    - `poseidon.data.shards.load_index` auto-creates `index.json` for `.npz` shards and keeps metadata in sync.
    - `split_by_cycle_pass` groups shards by SWOT cycle/pass before sampling validation and test ratios.
    - `ShardedDataModule` combines these utilities; its `stats` field captures bbox and time statistics that the positional encoders consume.
+  - To avoid recomputing the same splits on every launch, point `data.split_cache_path` (optionally with `data.split_cache_auto_write: true`) at a JSON file inside your experiment config. When the metadata (seed/ratios/index signature) matches, the datamodule loads the cached train/val/test lists instantly; otherwise it regenerates once and overwrites the cache for subsequent runs.
 
 ## Command-Line Interfaces
 
@@ -166,6 +167,7 @@ For exploratory runs, open `notebooks/rect_baseline_mlp_test.ipynb`. The noteboo
 ### Positional Encoders (`src/poseidon/models/pe`)
 | Encoder | Key Features |
 | --- | --- |
+| `latlon_minmax` | Scales lat/lon (and optional time) to [-1, 1] using dataset min/max stats for a lightweight, fully deterministic coordinate feed. |
 | `rect_baseline` | Normalises lat/lon within bbox, z-score time, and appends annual + configurable tidal harmonics. |
 | `cossin_simple` | Sin/cos cycles of scaled lat/lon with optional raw coordinates and daily/annual phases. |
 | `fourier` | Deterministic Fourier bases over lat/lon (and optionally time) plus optional XYZ embedding. |
@@ -194,6 +196,37 @@ Networks subclass `NetBase` and are registered via `@register_net`, enabling `po
 | `huber` | Piecewise quadratic/linear loss with configurable `delta`; integrates with uncertainty heads when present.
 
 The registry auto-discovers modules, so adding a new loss only requires decorating it with `@register_loss`.
+
+## Optimizer Usage
+
+All experiment configs share the same `optim` block; by default the Lightning module wraps the model with AdamW and optional EMA tracking. Typical YAML:
+
+```yaml
+optim:
+  lr: 3e-4           # AdamW learning rate
+  wd: 5e-5           # Weight decay applied to all parameters
+  betas: [0.9, 0.999]
+  ema: false         # Set true to keep an exponential moving average of weights
+  ema_decay: 0.999   # Only read when ema=true
+  schedule: warmcosine
+  warmup_epochs: 40
+  warmup_start_lr: 3e-5
+  eta_min: 5e-5
+```
+
+- **Base optimizer**: `torch.optim.AdamW` with config-supplied `lr`, `wd`, and `betas`. These values can be overridden via CLI (`--set optim.lr=1e-4`).
+- **Schedulers**: Selectable via `optim.schedule`. Options include:
+  - `none`/`constant`: raw AdamW without LR decay.
+  - `cosine`: vanilla cosine annealing across `trainer.max_epochs`.
+  - `cosine_warmup`/`warmup_cosine`: Lightning `SequentialLR` that linearly warms from `warmup_start` (or `warmup_start_lr`) before cosine decay.
+  - `warmcosine` (most configs): custom `LinearWarmupCosineAnnealingLR` that respects `warmup_epochs`, `warmup_start_lr`, `max_epochs`, and `eta_min` (floor LR).
+  - `plateau`: `ReduceLROnPlateau` keyed on `val_loss` with tunable `factor`, `patience`, and `min_lr`.
+  - `onecycle`: `OneCycleLR` over estimated stepping batches with `pct_start`, `div_factor`, and `final_div_factor`.
+  - `step`/`multistep`: Multi-step decay with user-defined `milestones` and `gamma`.
+- **Warmup semantics**: For `cosine_warmup` or `warmcosine`, make sure `warmup_epochs` is no larger than the total epoch budget; the helper clamps invalid values automatically but logging stays cleaner when they match intent.
+- **EMA weights**: Flip `optim.ema: true` to keep a detached moving average of parameters (decay via `ema_decay`); helpful for stabilizing SIREN tails. EMA checkpoints are not saved separately, so run-side eval should call `trainer.validate()` before toggling EMA off.
+
+Because schedulers live inside the Lightning module, every entry in the `optim` block can also be switched mid-experiment via `scripts/run.py --set`. When sweeping hyperparameters, include them in `--grid` (e.g., `--grid optim.omega0_initial=4,6,10`) and the runner will emit one sub-experiment per value.
 
 ## Downloader CLIs and Processing Pipeline
 
@@ -274,6 +307,17 @@ With these building blocks you can script full SWOT processing pipelines, experi
 Recent additions include:
 - `scripts/run.py` defaulting to the experiment-configured epoch budget unless `--epochs` is supplied.
 - Gradient diagnostics inside `LitRegressor`: feature encoder layouts are printed once per run and per-feature-group gradient norms are logged as `grad_norm/<group>` each epoch. Inspect these metrics (CSV logger or TensorBoard) to see which inputs drive the optimisation.
+
+## Grid Loss Search
+
+We routinely sweep positional-encoder hyperparameters to see which combination yields the lowest validation loss before committing to longer runs. The `swot_ssha_rff_mse` experiment showcases this workflow with a grid over spatial/temporal random Fourier feature counts:
+
+1. **Prepare the config** – `configs/experiments/swot_ssha_rff_mse.yaml` enables the physical RFF encoder with min/max time normalisation, annual harmonics, and no target normaliser. Adjust any defaults (learning rate, weight decay, shard paths) before launching the sweep.
+2. **Launch the grid** – either call `python scripts/run.py --configs configs/experiments/swot_ssha_rff_mse.yaml --grid model.pe.spatial_features=8,16,32 --grid model.pe.temporal_features=4,8,16` locally or submit `z_sbatch_scripts/run/run_swot_ssha_rff_mse_grid.sbatch` to SLURM. Each Cartesian combination inherits the base config and writes under `experiments/swot_ssha_rff_mse/<grid_id>` with its own Lightning logs and checkpoints.
+3. **Rank by loss** – once the jobs finish, run `python scripts/eval_summary.py --experiment-dir experiments/swot_ssha_rff_mse --top 10`. The summary CSV/console output sorts runs by validation loss so you can pick the best-performing feature budget (or spot over/under-fitting trends across the grid).
+4. **Promote the winner** – copy the most promising `grid_*` sub-config into a dedicated YAML (or bake the chosen hyperparameters back into `swot_ssha_rff_mse.yaml`) before firing longer training/eval workflows. Rerun the summary after any reruns to keep the loss leaderboard current.
+
+The same pattern works for any hyperparameter subset: add more `--grid key=...` entries, or mix `--set key=val` for single overrides. Because `scripts/run.py` shares context stats across runs, positional encoders always see the correct min/max/mean metadata during the sweep.
 
 
 ## To-Do 
